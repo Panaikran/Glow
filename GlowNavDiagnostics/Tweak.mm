@@ -1,9 +1,12 @@
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
+#import <mach-o/dyld.h>
 #import <os/log.h>
 #import <stdarg.h>
 #import <math.h>
+#import <string.h>
+#import <stdlib.h>
 
 static NSString * const kGNDLegacyBarClass = @"FBTabBar";
 static NSString * const kGNDFloatingBarClass = @"FBFloatingTabBar";
@@ -22,12 +25,23 @@ static const CFTimeInterval kGNDMaxTransitionPollDuration = 10.0;
 @property(nonatomic, strong) UIView *bar;
 @property(nonatomic, strong) UIView *item;
 @property(nonatomic, copy) NSString *tab;
+@property(nonatomic, copy) NSString *tabIdentifier;
+@property(nonatomic, copy) NSString *tabLabel;
+@property(nonatomic, copy) NSString *barClassName;
+@property(nonatomic, copy) NSString *itemClassName;
+@property(nonatomic, copy) NSString *controllerClassName;
+@property(nonatomic, strong) UIViewController *controller;
 @property(nonatomic, copy) NSArray<NSString *> *labels;
 @property(nonatomic, copy) NSArray<UILongPressGestureRecognizer *> *recognizers;
 @property(nonatomic, strong) NSMutableArray<NSString *> *lastStates;
 @property(nonatomic, strong) NSMutableArray<NSMutableSet<NSString *> *> *reachedStates;
 @property(nonatomic, assign) CFTimeInterval startTime;
 @property(nonatomic, assign) BOOL active;
+@property(nonatomic, assign) BOOL handlerWindowStarted;
+@property(nonatomic, assign) BOOL handlerWindowActive;
+@property(nonatomic, assign) CFTimeInterval handlerWindowStartTime;
+@property(nonatomic, assign) NSUInteger handlerCallCount;
+@property(nonatomic, assign) NSUInteger presentationAttemptCount;
 @end
 
 @implementation GNDHoldSession
@@ -38,9 +52,24 @@ static IMP gNDOriginalSendEvent = NULL;
 static UIView *gNDActiveBar;
 static UIViewController *gNDActiveController;
 static GNDHoldSession *gNDHoldSession;
+static GNDHoldSession *gNDHandlerSession;
 static NSUInteger gNDDiscoveryGeneration = 0;
 static CFTimeInterval gNDLastDiscoveryTrigger = 0;
 static BOOL gNDNavbarLoggedThisActivation = NO;
+static NSMutableSet<NSValue *> *gNDInventoriedClasses;
+static NSMutableSet<NSString *> *gNDInstalledCandidateMethods;
+static NSMutableSet<NSString *> *gNDScannedGlowImages;
+static NSMutableSet<NSString *> *gNDUnavailableRuntimeNames;
+static BOOL gNDLoggedGlowNotLoaded = NO;
+static Method gNDPresentationMethod = NULL;
+static IMP gNDOriginalPresentation = NULL;
+static IMP gNDPresentationReplacement = NULL;
+static NSUInteger gNDHandlerWindowGeneration = 0;
+
+static void GNDMaybeStartHandlerWindow(void);
+static void GNDStartHandlerWindow(GNDHoldSession *session, NSString *recognizerLabel);
+static void GNDDiscoverMethods(void);
+static void GNDScanGlowImage(void);
 
 static void GNDLog(NSString *format, ...) {
     va_list args;
@@ -50,6 +79,15 @@ static void GNDLog(NSString *format, ...) {
 
     os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_INFO, "%{public}@",
                      [@"[GlowNavDiag] " stringByAppendingString:message]);
+}
+
+static void GNDLogTagged(NSString *tag, NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_INFO, "%{public}@",
+                     [NSString stringWithFormat:@"[GlowNavDiag][%@] %@", tag, message]);
 }
 
 static NSString *GNDString(id value) {
@@ -321,6 +359,8 @@ static void GNDTryNavbarDiscovery(NSUInteger generation, NSUInteger attempt) {
     UIViewController *controller = nil;
     UIView *bar = GNDCurrentNavbar(&window, &controller);
     if (bar && controller && window) {
+        GNDScanGlowImage();
+        GNDDiscoverMethods();
         GNDLogNavbarIfChanged(bar, controller, window);
         return;
     }
@@ -407,6 +447,335 @@ static void GNDRecordRecognizerStates(GNDHoldSession *session) {
             }
             session.lastStates[index] = state;
         }
+        if ([session.labels[index] isEqualToString:@"controller-longpress"] ||
+            [session.labels[index] isEqualToString:@"legacy-controller-longpress"]) {
+            if (recognizer.state == UIGestureRecognizerStateBegan) {
+                GNDStartHandlerWindow(session, session.labels[index]);
+            }
+        }
+    }
+}
+
+static BOOL GNDClassIsInFacebookApp(Class cls) {
+    const char *imageName = cls ? class_getImageName(cls) : NULL;
+    if (!imageName) return NO;
+    NSString *image = [NSString stringWithUTF8String:imageName];
+    NSString *bundle = NSBundle.mainBundle.bundlePath;
+    return [image isEqualToString:NSBundle.mainBundle.executablePath] ||
+        [image hasPrefix:[bundle stringByAppendingString:@"/"]];
+}
+
+static BOOL GNDSelectorIsInteresting(NSString *selector) {
+    static NSArray<NSString *> *keywords;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        keywords = @[@"long", @"press", @"gesture", @"tab", @"item", @"menu",
+                     @"context", @"shortcut", @"action", @"select", @"reorder",
+                     @"configure", @"settings"];
+    });
+    NSString *lower = selector.lowercaseString;
+    for (NSString *keyword in keywords) {
+        if ([lower containsString:keyword]) return YES;
+    }
+    return NO;
+}
+
+static BOOL GNDSelectorIsHandlerCandidate(NSString *selector, BOOL exactTargetClass) {
+    NSString *lower = selector.lowercaseString;
+    for (NSString *keyword in @[@"long", @"press", @"gesture", @"menu", @"context",
+                                @"shortcut", @"settings"]) {
+        if ([lower containsString:keyword]) return YES;
+    }
+    return exactTargetClass && [lower containsString:@"action"];
+}
+
+static NSString *GNDMethodSignatureDescription(Method method) {
+    const char *encoding = method ? method_getTypeEncoding(method) : NULL;
+    return encoding ? [NSString stringWithUTF8String:encoding] : @"?";
+}
+
+static BOOL GNDMethodHasSafeObjectSignature(Method method, NSUInteger *objectArgumentCount) {
+    const char *encoding = method ? method_getTypeEncoding(method) : NULL;
+    if (!encoding) return NO;
+    NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:encoding];
+    if (!signature || signature.methodReturnType[0] != 'v' ||
+        signature.numberOfArguments < 2 || signature.numberOfArguments > 5) return NO;
+
+    NSUInteger explicitCount = signature.numberOfArguments - 2;
+    for (NSUInteger index = 2; index < signature.numberOfArguments; index++) {
+        const char *type = [signature getArgumentTypeAtIndex:index];
+        while (type && strchr("rnNoORV", type[0])) type++;
+        if (!type || (type[0] != '@' && type[0] != '#')) return NO;
+    }
+    if (objectArgumentCount) *objectArgumentCount = explicitCount;
+    return YES;
+}
+
+static NSString *GNDObjectDescription(id object) {
+    if (!object) return @"nil";
+    if (object == NSNull.null) return @"nil";
+    return [NSString stringWithFormat:@"%@#%p", GNDClassName(object_getClass(object)), object];
+}
+
+static BOOL GNDHandlerWindowIsActive(void) {
+    GNDHoldSession *session = gNDHandlerSession;
+    return session && session.handlerWindowActive &&
+        CACurrentMediaTime() - session.handlerWindowStartTime <= 1.0;
+}
+
+static NSString *GNDHandlerContext(GNDHoldSession *session) {
+    if (!session) return @"bar=- item=- tab=- id=-";
+    return [NSString stringWithFormat:@"bar=%@#%p item=%@#%p tab=%@ id=%@",
+            session.barClassName ?: @"-", session.bar,
+            session.itemClassName ?: @"-", session.item,
+            session.tabLabel.length ? session.tabLabel : session.tab,
+            session.tabIdentifier ?: @"-"];
+}
+
+static void GNDLogCandidateCall(id object, SEL selector, NSArray *arguments) {
+    GNDMaybeStartHandlerWindow();
+    if (!GNDHandlerWindowIsActive()) return;
+    GNDHoldSession *session = gNDHandlerSession;
+    session.handlerCallCount++;
+    NSMutableArray<NSString *> *argumentDescriptions = [NSMutableArray arrayWithCapacity:arguments.count];
+    for (id argument in arguments) [argumentDescriptions addObject:GNDObjectDescription(argument)];
+    CFTimeInterval elapsed = CACurrentMediaTime() - session.handlerWindowStartTime;
+    GNDLogTagged(@"CALL", @"elapsed=%.3f selector=%@ self=%@#%p args=[%@] controller=%@#%p %@",
+                 elapsed, NSStringFromSelector(selector), GNDClassName(object_getClass(object)), object,
+                 argumentDescriptions.count ? [argumentDescriptions componentsJoinedByString:@", "] : @"",
+                 session.controllerClassName ?: @"-", session.controller,
+                 GNDHandlerContext(session));
+}
+
+static NSString *GNDInstallCandidateMethod(Class owner, Method method) {
+    NSUInteger argumentCount = 0;
+    if (!GNDMethodHasSafeObjectSignature(method, &argumentCount)) return @"skip-signature";
+
+    SEL selector = method_getName(method);
+    NSString *key = [NSString stringWithFormat:@"%p:%@", owner, NSStringFromSelector(selector)];
+    if ([gNDInstalledCandidateMethods containsObject:key]) return @"installed";
+
+    IMP original = method_getImplementation(method);
+    IMP replacement = NULL;
+    switch (argumentCount) {
+        case 0:
+            replacement = imp_implementationWithBlock(^(id object) {
+                GNDLogCandidateCall(object, selector, @[]);
+                ((void (*)(id, SEL))original)(object, selector);
+            });
+            break;
+        case 1:
+            replacement = imp_implementationWithBlock(^(id object, id first) {
+                GNDLogCandidateCall(object, selector, @[first ?: NSNull.null]);
+                ((void (*)(id, SEL, id))original)(object, selector, first);
+            });
+            break;
+        case 2:
+            replacement = imp_implementationWithBlock(^(id object, id first, id second) {
+                GNDLogCandidateCall(object, selector,
+                                    @[first ?: NSNull.null, second ?: NSNull.null]);
+                ((void (*)(id, SEL, id, id))original)(object, selector, first, second);
+            });
+            break;
+        case 3:
+            replacement = imp_implementationWithBlock(^(id object, id first, id second, id third) {
+                GNDLogCandidateCall(object, selector,
+                                    @[first ?: NSNull.null, second ?: NSNull.null,
+                                      third ?: NSNull.null]);
+                ((void (*)(id, SEL, id, id, id))original)(object, selector,
+                                                          first, second, third);
+            });
+            break;
+        default:
+            return @"skip-arity";
+    }
+    if (!replacement) return @"skip-wrapper";
+
+    method_setImplementation(method, replacement);
+    [gNDInstalledCandidateMethods addObject:key];
+    return @"installed";
+}
+
+static void GNDDiscoverMethods(void) {
+    if (!gNDInventoriedClasses) gNDInventoriedClasses = [NSMutableSet set];
+    if (!gNDInstalledCandidateMethods) gNDInstalledCandidateMethods = [NSMutableSet set];
+    if (!gNDUnavailableRuntimeNames) gNDUnavailableRuntimeNames = [NSMutableSet set];
+    NSArray<NSString *> *requestedClasses = @[kGNDTabControllerClass, kGNDLegacyBarClass,
+                                               kGNDLegacyItemClass, kGNDFloatingBarClass,
+                                               kGNDFloatingItemClass];
+    for (NSString *requestedName in requestedClasses) {
+        Class requested = NSClassFromString(requestedName);
+        if (!requested) {
+            if (![gNDUnavailableRuntimeNames containsObject:requestedName]) {
+                [gNDUnavailableRuntimeNames addObject:requestedName];
+                GNDLogTagged(@"METHOD", @"class=%@ unavailable", requestedName);
+            }
+            continue;
+        }
+        [gNDUnavailableRuntimeNames removeObject:requestedName];
+        for (Class cls = requested; cls; cls = class_getSuperclass(cls)) {
+            NSValue *classKey = [NSValue valueWithPointer:(__bridge const void *)cls];
+            if ([gNDInventoriedClasses containsObject:classKey]) continue;
+            [gNDInventoriedClasses addObject:classKey];
+
+            unsigned int count = 0;
+            Method *methods = class_copyMethodList(cls, &count);
+            NSMutableArray<NSString *> *inventory = [NSMutableArray array];
+            for (unsigned int index = 0; index < count; index++) {
+                Method method = methods[index];
+                NSString *selectorName = NSStringFromSelector(method_getName(method));
+                if (!GNDSelectorIsInteresting(selectorName)) continue;
+
+                NSString *trace = @"inventory-only";
+                if (GNDSelectorIsHandlerCandidate(selectorName, cls == requested) &&
+                    GNDClassIsInFacebookApp(cls)) {
+                    trace = GNDInstallCandidateMethod(cls, method);
+                }
+                [inventory addObject:[NSString stringWithFormat:@"%@{%@,%@}", selectorName,
+                                     GNDMethodSignatureDescription(method), trace]];
+            }
+            free(methods);
+            GNDLogTagged(@"METHOD", @"class=%@ superclass=%@ selectors=%@",
+                         GNDClassName(cls), GNDClassName(class_getSuperclass(cls)),
+                         inventory.count ? [inventory componentsJoinedByString:@"; "] : @"none");
+        }
+    }
+}
+
+static Method GNDDirectInstanceMethod(Class cls, SEL selector) {
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    Method found = NULL;
+    for (unsigned int index = 0; index < count; index++) {
+        if (method_getName(methods[index]) == selector) {
+            found = methods[index];
+            break;
+        }
+    }
+    free(methods);
+    return found;
+}
+
+static void GNDPresentViewController(id presenter, SEL selector, UIViewController *presented,
+                                     BOOL animated, void (^completion)(void)) {
+    GNDMaybeStartHandlerWindow();
+    if (GNDHandlerWindowIsActive()) {
+        GNDHoldSession *session = gNDHandlerSession;
+        session.presentationAttemptCount++;
+        GNDLogTagged(@"PRESENT", @"elapsed=%.3f selector=%@ presenter=%@#%p presented=%@#%p animated=%@ %@",
+                     CACurrentMediaTime() - session.handlerWindowStartTime,
+                     NSStringFromSelector(selector), GNDClassName(object_getClass(presenter)), presenter,
+                     GNDClassName(object_getClass(presented)), presented,
+                     animated ? @"YES" : @"NO", GNDHandlerContext(session));
+    }
+    IMP original = gNDOriginalPresentation;
+    if (original) {
+        ((void (*)(id, SEL, UIViewController *, BOOL, void (^)(void)))original)(
+            presenter, selector, presented, animated, completion);
+    }
+}
+
+static BOOL GNDInstallPresentationObserver(void) {
+    if (gNDPresentationMethod && gNDPresentationReplacement) {
+        return method_getImplementation(gNDPresentationMethod) == gNDPresentationReplacement;
+    }
+    Class cls = UIViewController.class;
+    SEL selector = @selector(presentViewController:animated:completion:);
+    Method method = GNDDirectInstanceMethod(cls, selector);
+    if (!method) return NO;
+    NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(method)];
+    if (!signature || signature.numberOfArguments != 5 || signature.methodReturnType[0] != 'v') return NO;
+    const char *controllerType = [signature getArgumentTypeAtIndex:2];
+    const char *animatedType = [signature getArgumentTypeAtIndex:3];
+    const char *completionType = [signature getArgumentTypeAtIndex:4];
+    if (!controllerType || controllerType[0] != '@' || !animatedType ||
+        (animatedType[0] != 'c' && animatedType[0] != 'B') ||
+        !completionType || completionType[0] != '@') return NO;
+
+    IMP current = method_getImplementation(method);
+    if (current == (IMP)GNDPresentViewController) return YES;
+    gNDPresentationMethod = method;
+    gNDOriginalPresentation = current;
+    gNDPresentationReplacement = (IMP)GNDPresentViewController;
+    method_setImplementation(method, gNDPresentationReplacement);
+    return YES;
+}
+
+static void GNDRemovePresentationObserver(void) {
+    if (!gNDPresentationMethod || !gNDPresentationReplacement) return;
+    if (method_getImplementation(gNDPresentationMethod) != gNDPresentationReplacement) return;
+    method_setImplementation(gNDPresentationMethod, gNDOriginalPresentation);
+    gNDPresentationMethod = NULL;
+    gNDOriginalPresentation = NULL;
+    gNDPresentationReplacement = NULL;
+}
+
+static void GNDEndHandlerWindow(GNDHoldSession *session, NSUInteger generation) {
+    if (!session || !session.handlerWindowActive || generation != gNDHandlerWindowGeneration) return;
+    session.handlerWindowActive = NO;
+    GNDRemovePresentationObserver();
+    GNDLogTagged(@"HANDLER", @"window complete tab=%@ calls=%lu presentations=%lu",
+                 session.tabLabel.length ? session.tabLabel : session.tab,
+                 (unsigned long)session.handlerCallCount,
+                 (unsigned long)session.presentationAttemptCount);
+}
+
+static void GNDStartHandlerWindow(GNDHoldSession *session, NSString *recognizerLabel) {
+    if (!session || session.handlerWindowStarted) return;
+    session.handlerWindowStarted = YES;
+    session.handlerWindowActive = YES;
+    session.handlerWindowStartTime = CACurrentMediaTime();
+    gNDHandlerSession = session;
+    NSUInteger generation = ++gNDHandlerWindowGeneration;
+    BOOL presentationObserver = GNDInstallPresentationObserver();
+    GNDLogTagged(@"HANDLER", @"elapsed=%.3f trigger=%@->began controller=%@#%p %@ presentationObserver=%@ window=1.0s",
+                 session.handlerWindowStartTime - session.startTime, recognizerLabel,
+                 session.controllerClassName ?: @"-", session.controller,
+                 GNDHandlerContext(session), presentationObserver ? @"installed" : @"unavailable");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        GNDEndHandlerWindow(session, generation);
+    });
+}
+
+static void GNDMaybeStartHandlerWindow(void) {
+    GNDHoldSession *session = gNDHoldSession;
+    if (!session || session.handlerWindowStarted) return;
+    for (NSUInteger index = 0; index < session.recognizers.count; index++) {
+        NSString *label = session.labels[index];
+        if (([label isEqualToString:@"controller-longpress"] ||
+             [label isEqualToString:@"legacy-controller-longpress"]) &&
+            session.recognizers[index].state == UIGestureRecognizerStateBegan) {
+            GNDStartHandlerWindow(session, label);
+            return;
+        }
+    }
+}
+
+static void GNDScanGlowImage(void) {
+    if (!gNDScannedGlowImages) gNDScannedGlowImages = [NSMutableSet set];
+    BOOL found = NO;
+    uint32_t imageCount = _dyld_image_count();
+    for (uint32_t index = 0; index < imageCount; index++) {
+        const char *imageName = _dyld_get_image_name(index);
+        if (!imageName) continue;
+        NSString *path = [NSString stringWithUTF8String:imageName];
+        if ([path.lastPathComponent caseInsensitiveCompare:@"Glow.dylib"] != NSOrderedSame) continue;
+        found = YES;
+        if ([gNDScannedGlowImages containsObject:path]) continue;
+        [gNDScannedGlowImages addObject:path];
+        GNDLogTagged(@"GLOW", @"image=%@", path);
+        unsigned int classCount = 0;
+        const char **classNames = objc_copyClassNamesForImage(imageName, &classCount);
+        for (unsigned int classIndex = 0; classNames && classIndex < classCount; classIndex++) {
+            if (classNames[classIndex]) {
+                GNDLogTagged(@"GLOW", @"class=%s", classNames[classIndex]);
+            }
+        }
+        free((void *)classNames);
+    }
+    if (!found && !gNDLoggedGlowNotLoaded) {
+        gNDLoggedGlowNotLoaded = YES;
+        GNDLogTagged(@"GLOW", @"image=not-loaded");
     }
 }
 
@@ -444,6 +813,8 @@ static void GNDStartHold(UITouch *touch) {
     UIWindow *window = touch.window ?: item.window;
     UIViewController *controller = GNDTabControllerForView(bar) ?: gNDActiveController;
     if (!controller || !window) return;
+    GNDScanGlowImage();
+    GNDDiscoverMethods();
     GNDLogNavbarIfChanged(bar, controller, window);
 
     NSString *identifier = GNDAccessibilityIdentifier(item);
@@ -464,6 +835,12 @@ static void GNDStartHold(UITouch *touch) {
     session.bar = bar;
     session.item = item;
     session.tab = tab;
+    session.tabIdentifier = identifier;
+    session.tabLabel = label;
+    session.barClassName = GNDClassName(bar.class);
+    session.itemClassName = GNDClassName(item.class);
+    session.controller = controller;
+    session.controllerClassName = GNDClassName(controller.class);
     session.labels = labels;
     session.recognizers = recognizers;
     session.lastStates = [NSMutableArray arrayWithCapacity:recognizers.count];
@@ -533,6 +910,7 @@ static void GNDSendEvent(UIApplication *application, SEL selector, UIEvent *even
     if (original) {
         ((void (*)(UIApplication *, SEL, UIEvent *))original)(application, selector, event);
     }
+    if (gNDHoldSession) GNDRecordRecognizerStates(gNDHoldSession);
     for (UITouch *touch in beganTouches) GNDStartHold(touch);
     for (UITouch *touch in finishedTouches) GNDFinishHold(touch);
 }
@@ -559,6 +937,7 @@ static void GNDInitialize(void) {
     @autoreleasepool {
         if (!GNDIsFacebookProcess()) return;
         gNDEnabled = GNDInstallSendEventHook();
+        GNDScanGlowImage();
         GNDLog(@"loaded bundle=%@ executable=%@ iOS=%@ sendEventHook=%@",
                NSBundle.mainBundle.bundleIdentifier ?: @"-",
                NSBundle.mainBundle.infoDictionary[@"CFBundleExecutable"] ?: @"-",
