@@ -31,29 +31,28 @@ Read-only runtime discovery for Facebook's bottom navigation. This tweak does no
 
 ## Build
 
-Build with Theos on macOS, Linux, or WSL. Set `THEOS` to the Theos checkout, then run:
+Build with the existing Theos checkout on macOS, Linux, or WSL. This Windows checkout is on `/mnt/c`, where Theos package staging failed because directories appeared as mode `0777`; build from an ext4 copy instead. For this Facebook IPA, use:
 
 ```sh
-make clean package
+THEOS=/path/to/theos make -C /path/on/ext4/GlowNavDiagnostics ARCHS=arm64 FINALPACKAGE=1 package
 ```
 
-The package is written under `packages/`. The Makefile includes `arm64` and `arm64e` slices and targets iOS 15 or later. No Theos toolchain is configured in this Windows workspace, so the package has not been built here.
+The package is written under `packages/`. The Makefile targets iOS 15 or later and defaults to `arm64` plus `arm64e`; Facebook 580.0.0's main executable is arm64-only, so the tested diagnostic package was built for arm64. The WSL build used Theos at `/home/panaikran/theos` with its iPhoneOS 16.5 SDK.
 
 If the app was injected with a custom bundle identifier, add that identifier to `GlowNavDiagnostics.plist` under `Filter.Bundles` before building. The runtime guard also accepts an app whose executable remains `Facebook`.
 
 ## Inject alongside Facebook and Glow
 
-Use a decrypted Facebook IPA you already have. With cyan installed, pass both debs to its `-f` option (which accepts multiple files):
+Use the exact decrypted IPA under test. Cyan's `-f` accepts multiple files; for Facebook 580.0.0 the selected Glow package was `com.dvntm.glow_1.3.1_iphoneos-arm64.deb` (its dylib is ARM64, and Cyan successfully handled its `var/jb` package path):
 
 ```sh
-cyan -i facebook.ipa -o Glow_FB_navdiag.ipa -u -w -e -s \
-  -f glow_fb.deb GlowNavDiagnostics.deb \
-  -n Facebook -b com.facebook.Facebook
+cyan -i facebook.ipa -o Glow_FB_navdiag.ipa \
+  -f com.dvntm.glow_1.3.1_iphoneos-arm64.deb GlowNavDiagnostics_0.1.0_iphoneos-arm.deb
 ```
 
-For the first reproduction, use the same Glow deb that your normal workflow selects and record its filename. The current workflow selects the `iphoneos-arm` asset; if you also compare against an explicit `iphoneos-arm64` or `iphoneos-arm64e` asset, keep those runs separate. That distinguishes package selection/loading from a Facebook UI-hook change.
+The `iphoneos-arm64e` release asset also contains an ARM64-only Glow dylib, despite its package architecture label. The injected IPA kept its original entries and gained both tweaks plus Cyan's embedded CydiaSubstrate compatibility framework. Do not use Cyan's `-e`, `-q`, or `-s` options for this LiveContainer test: preserve app extensions and slices, then sign through the normal LiveContainer/SideStore route.
 
-Install/sign `Glow_FB_navdiag.ipa` through the same LiveContainer/SideStore path as the failing build. Launch Facebook, wait 15 seconds on the main screen, and tap several bottom tabs once. To compare with an older Facebook build, repeat with an older IPA already available to you; the diagnostic code and injection procedure are unchanged.
+After importing/signing through LiveContainer or SideStore, start log capture, launch Facebook, wait for Home to settle, tap each bottom tab once, return Home, long-press each tab, and switch tabs several more times. Rotate only if useful, then terminate Facebook. No posts, messages, or other personal content need to be opened. To compare an older build, repeat with an older IPA already available to you.
 
 ## Collect and return logs
 
@@ -61,6 +60,12 @@ Search device syslog for this exact prefix:
 
 ```text
 [GlowNavDiag]
+```
+
+With `idevicesyslog` connected to the device, capture only diagnostic lines with:
+
+```sh
+idevicesyslog --match "[GlowNavDiag]" | tee GlowNavDiag.log
 ```
 
 Useful record markers are:
