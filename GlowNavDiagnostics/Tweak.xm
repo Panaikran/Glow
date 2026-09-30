@@ -343,12 +343,6 @@ static NSArray<UIWindow *> *GNDVisibleWindows(void) {
     NSMutableArray<UIWindow *> *windows = [NSMutableArray array];
     NSHashTable<UIWindow *> *seen = [NSHashTable hashTableWithOptions:NSPointerFunctionsObjectPointerPersonality];
 
-    for (UIWindow *window in application.windows) {
-        if (window && ![seen containsObject:window]) {
-            [seen addObject:window];
-            [windows addObject:window];
-        }
-    }
     for (UIScene *scene in application.connectedScenes) {
         if (![scene isKindOfClass:UIWindowScene.class]) continue;
         for (UIWindow *window in ((UIWindowScene *)scene).windows) {
