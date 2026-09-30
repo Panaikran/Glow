@@ -1,8 +1,0 @@
-Package: com.panaikran.glownavdiagnostics
-Name: GlowNavDiagnostics
-Version: 0.1.0
-Architecture: iphoneos-arm
-Description: Read-only Facebook bottom navigation diagnostics
-Maintainer: Panaikran
-Author: Panaikran
-Section: Tweaks
