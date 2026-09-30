@@ -1,1 +1,5 @@
 .DS_Store
+*.deb
+*.ipa
+/artifacts/
+/GlowNavDiagnostics/.theos/
