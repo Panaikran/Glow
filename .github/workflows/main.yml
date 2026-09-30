@@ -46,13 +46,30 @@ jobs:
           exclude_inputs: display_name,bundle_id
 
       - name: Download and validate IPA
+        shell: bash
         run: |
-          wget "${{ inputs.ipa_url }}" --no-verbose -O ${{ github.workspace }}/facebook.ipa
+          set -euo pipefail
 
-          file_type=$(file --mime-type -b ${{ github.workspace }}/facebook.ipa)
+          ipa_url="${{ inputs.ipa_url }}"
+          ipa_path="${{ github.workspace }}/facebook.ipa"
+
+          if [[ "$ipa_url" == *"drive.google.com"* ]]; then
+            echo "Google Drive URL detected; using gdown to handle Drive confirmation pages."
+            pipx run gdown "$ipa_url" -O "$ipa_path"
+          else
+            echo "Direct URL detected; downloading with curl."
+            curl --fail --location --retry 3 --retry-delay 2 "$ipa_url" -o "$ipa_path"
+          fi
+
+          file_type=$(file --mime-type -b "$ipa_path")
 
           if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
             echo "::error::Validation failed: The downloaded file is not a valid IPA. Detected type: $file_type."
+            exit 1
+          fi
+
+          if ! unzip -tq "$ipa_path" >/dev/null; then
+            echo "::error::Validation failed: The downloaded file is not a readable IPA/ZIP archive."
             exit 1
           fi
 
