@@ -440,7 +440,7 @@ static BOOL GNDIsFacebookProcess(void) {
 }
 
 static void GNDLogBottomTouch(UITouch *touch) {
-    if (!gNDEnabled || gNDSequence == 0 || touch.phase != UITouchPhaseBegan || gNDBottomTouchLogs >= 50) return;
+    if (!gNDEnabled || gNDSequence == 0 || gNDBottomTouchLogs >= 50) return;
 
     UIView *hitView = touch.view;
     UIWindow *window = touch.window ?: hitView.window;
@@ -480,10 +480,16 @@ static void GNDLogBottomTouch(UITouch *touch) {
 
 %hook UIApplication
 - (void)sendEvent:(UIEvent *)event {
+    NSMutableArray<UITouch *> *beganTouches = nil;
     if (gNDEnabled && event.type == UIEventTypeTouches) {
-        for (UITouch *touch in event.allTouches) GNDLogBottomTouch(touch);
+        for (UITouch *touch in event.allTouches) {
+            if (touch.phase != UITouchPhaseBegan) continue;
+            if (!beganTouches) beganTouches = [NSMutableArray arrayWithCapacity:1];
+            [beganTouches addObject:touch];
+        }
     }
     %orig;
+    for (UITouch *touch in beganTouches) GNDLogBottomTouch(touch);
 }
 %end
 
