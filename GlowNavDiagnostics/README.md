@@ -1,16 +1,16 @@
 # GlowNavDiagnostics
 
-Standalone, read-only diagnostic for Facebook 580's legacy and floating bottom navigation. It does not modify Glow's implementation, Facebook views, or gesture settings.
+Standalone, passive runtime probe for Facebook 580 and Glow 1.3.1. It inspects only named navbar and Glow classes. It does not add or remove interactions, invoke Glow methods, or change Facebook gesture behavior.
 
-## What it records
+## Runtime evidence
 
-- The active `FBTabBar` or `FBFloatingTabBar`, its controller, and visible tab items.
-- Filtered instance-method inventories for the two bar classes, two known item classes, `FBTabBarViewController`, and their superclass chains. There is no global class or selector scan.
-- Calls to candidate long-press, gesture, menu, context, shortcut, action, and settings methods. Only Facebook-app-owned methods with `void` return and up to three Objective-C object arguments are wrapped; all original arguments and return behavior are forwarded unchanged. Other signatures are listed but not hooked.
-- A one-second post-`.began` window. The diagnostic temporarily observes `UIViewController`'s direct `presentViewController:animated:completion:` implementation, if its runtime signature matches, and restores the implementation after the window.
-- Whether `Glow.dylib` is loaded and Objective-C classes defined by that image only.
+- Resolves `FBTabBarItemDefaultView`'s `contextMenuInteraction:configurationForMenuAtLocation:` implementation, its direct owner, type encoding, IMP image, and symbol using Objective-C runtime APIs and `dladdr`. It never calls the IMP.
+- Inventories filtered instance and class methods only on the six named Glow classes. It separately reports direct methods on `FBTabBar`, `FBTabBarViewController`, and `FBTabBarItemDefaultView` whose IMP image is `Glow.dylib`.
+- Reports `UIContextMenuInteractionDelegate` conformance for those Glow classes and the legacy tab item.
+- Inspects the public `UIView.interactions` collection on visible navbar items and records context-menu delegate class/address when present.
+- Passively forwards `UIContextMenuInteraction initWithDelegate:` and `UIView addInteraction:` unchanged. Logs creation when its delegate or caller is Glow/navbar-related, and attachment only for context-menu interactions on the four named navbar classes.
 
-The diagnostic does not intercept `isKindOfClass:` because that would require broad `NSObject` tracing. It therefore cannot prove whether Facebook performs a legacy class check. Presentation tracing covers calls dispatched through `UIViewController`'s direct implementation; an override that does not call `super`, or a non-view-controller menu API, may be missed. Related candidate selector calls may still appear in `[CALL]` lines.
+The probe does not use a global class scan, private KVC, unknown ivars, stack walking, or method invocation on Glow classes. If no legacy item exists in Facebook 580, the legacy item's naturally occurring attachment can still be observed through the narrow `addInteraction:` observer, but an interaction that was attached before the probe loaded and exists outside the visible navbar will not be discovered.
 
 ## Build
 
@@ -20,23 +20,22 @@ Build the standalone arm64 library from an ext4 WSL directory with the existing 
 THEOS=/home/panaikran/theos make -C /path/on/ext4/GlowNavDiagnostics ARCHS=arm64 FINALPACKAGE=1 clean all
 ```
 
-The project uses `library.mk`, Objective-C runtime APIs, and a C constructor. It targets iOS 15.0 and has no Logos or Substrate linkage. The output is a raw dylib for direct LiveContainer loading; no `.deb` is produced.
+The project uses `library.mk`, targets iOS 15.0, and has no Logos or Substrate linkage. The output is a raw dylib for direct LiveContainer loading; no `.deb` is produced.
 
 ## Facebook 580 test procedure
 
-1. In LiveContainer, assign Facebook 580 to the tweak folder containing both **Glow** and **GlowNavDiagnostics_0.3.0_arm64.dylib**.
-2. Confirm the floating navbar is active.
+1. Use the Facebook 580 IPA with Glow already embedded at `Facebook.app/Frameworks/Glow.dylib`.
+2. In LiveContainer, enable only **GlowNavDiagnostics_0.4.0_arm64.dylib** from the tweak folder.
 3. Start filtered logging:
 
    ```sh
-   idevicesyslog --match '\[GlowNavDiag\]' | tee GlowNavDiag-facebook580.log
+   idevicesyslog --match '\[GlowNavDiag\]' | tee GlowNavDiag-facebook580-0.4.log
    ```
 
-4. Launch Facebook 580.
-5. Wait for `[GlowNavDiag] navbar mode=floating`.
-6. Press and hold **Home** until `[GlowNavDiag][HANDLER]` reports `trigger=controller-longpress->began`. Hold for about 1.5–2 seconds to let the observation window complete.
-7. Release.
+4. Fully terminate Facebook, then launch it.
+5. Wait for navbar initialization and let the app sit for about five seconds. Do not long-press initially.
+6. Optionally tap between Home and Reels once.
+7. Optionally long-press Home once afterward.
 8. Stop logging.
-9. Optionally repeat once on **Reels**.
 
-Send back the `[METHOD]` and `[GLOW]` lines, the navbar and recognizer inventory, and all `[HANDLER]`, `[CALL]`, and `[PRESENT]` lines for each hold. Note the approximate haptic timing separately if one occurs; this diagnostic does not infer its source.
+Send the `[LEGACY-IMP]`, `[GLOW-METHOD]`, `[GLOW-PATCH]`, `[PROTOCOL]`, `[INTERACTION]`, `[CTX-CREATE]`, and `[CTX-ATTACH]` lines, plus the `[GLOW]` image line and navbar/item inventory. This is runtime metadata only; whether the standalone dylib loads in LiveContainer and which interactions Facebook creates still require device verification.
