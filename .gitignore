@@ -3,3 +3,4 @@
 *.ipa
 /artifacts/
 /GlowNavDiagnostics/.theos/
+/GlowCompat/.theos/
