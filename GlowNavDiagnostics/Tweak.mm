@@ -2,10 +2,12 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
 #import <dlfcn.h>
 #import <os/log.h>
 #import <stdarg.h>
 #import <stdlib.h>
+#import <stdint.h>
 #import <string.h>
 
 static NSString * const kGNDLegacyBarClass = @"FBTabBar";
@@ -34,6 +36,7 @@ static NSMutableDictionary<NSString *, NSString *> *gNDInteractionSnapshots;
 static NSMutableDictionary<NSString *, NSString *> *gNDProtocolStates;
 static NSMutableSet<NSString *> *gNDLoggedMethodEntries;
 static NSMutableSet<NSString *> *gNDLoggedPatchEntries;
+static NSMutableSet<NSString *> *gNDLoggedIMPMaps;
 
 static void GNDRefreshRuntimeMetadata(void);
 static void GNDStartNavbarDiscovery(void);
@@ -98,6 +101,89 @@ static BOOL GNDIsGlowImage(NSString *image) {
     if (!image.length) return NO;
     if (gNDGlowImagePath.length) return [image isEqualToString:gNDGlowImagePath];
     return [image.lastPathComponent caseInsensitiveCompare:@"Glow.dylib"] == NSOrderedSame;
+}
+
+typedef struct {
+    uint32_t imageIndex;
+    const struct mach_header *header;
+    intptr_t slide;
+    uint64_t textVMAddr;
+    uintptr_t runtimeTextBase;
+} GNDLoadedImageLayout;
+
+static BOOL GNDLoadedImageLayoutForAddress(const void *imageBase, NSString *imagePath,
+                                           GNDLoadedImageLayout *layoutOut) {
+    uint32_t imageCount = _dyld_image_count();
+    for (uint32_t index = 0; index < imageCount; index++) {
+        const struct mach_header *header = _dyld_get_image_header(index);
+        const char *pathBytes = _dyld_get_image_name(index);
+        if (!header) continue;
+        NSString *loadedPath = pathBytes ? [NSString stringWithUTF8String:pathBytes] : nil;
+        BOOL pathMatches = imagePath.length && loadedPath.length &&
+            [imagePath.stringByStandardizingPath isEqualToString:loadedPath.stringByStandardizingPath];
+        if (header != imageBase && !pathMatches) continue;
+        if (header->magic != MH_MAGIC_64) return NO;
+
+        const struct mach_header_64 *header64 = (const struct mach_header_64 *)header;
+        const uint8_t *cursor = (const uint8_t *)header64 + sizeof(*header64);
+        const uint8_t *commandsEnd = cursor + header64->sizeofcmds;
+        BOOL foundText = NO;
+        uint64_t textVMAddr = 0;
+        for (uint32_t commandIndex = 0; commandIndex < header64->ncmds; commandIndex++) {
+            if (cursor + sizeof(struct load_command) > commandsEnd) break;
+            const struct load_command *command = (const struct load_command *)cursor;
+            if (command->cmdsize < sizeof(struct load_command) || cursor + command->cmdsize > commandsEnd) break;
+            if (command->cmd == LC_SEGMENT_64 && command->cmdsize >= sizeof(struct segment_command_64)) {
+                const struct segment_command_64 *segment = (const struct segment_command_64 *)command;
+                if (strncmp(segment->segname, SEG_TEXT, sizeof(segment->segname)) == 0) {
+                    textVMAddr = segment->vmaddr;
+                    foundText = YES;
+                    break;
+                }
+            }
+            cursor += command->cmdsize;
+        }
+        if (!foundText) return NO;
+
+        intptr_t slide = _dyld_get_image_vmaddr_slide(index);
+        if (layoutOut) {
+            layoutOut->imageIndex = index;
+            layoutOut->header = header;
+            layoutOut->slide = slide;
+            layoutOut->textVMAddr = textVMAddr;
+            layoutOut->runtimeTextBase = (uintptr_t)((intptr_t)textVMAddr + slide);
+        }
+        return YES;
+    }
+    return NO;
+}
+
+static void GNDLogIMPMap(NSString *tag, NSString *className, NSString *selectorName, IMP imp) {
+    if (!imp) return;
+    Dl_info info = {0};
+    if (dladdr((const void *)imp, &info) == 0 || !info.dli_fname || !info.dli_fbase) return;
+    NSString *image = [NSString stringWithUTF8String:info.dli_fname];
+    if (!GNDIsGlowImage(image)) return;
+
+    NSString *key = [NSString stringWithFormat:@"%@:%@:%p:%@", className, selectorName, imp, image];
+    if (!gNDLoggedIMPMaps) gNDLoggedIMPMaps = [NSMutableSet set];
+    if ([gNDLoggedIMPMaps containsObject:key]) return;
+    [gNDLoggedIMPMaps addObject:key];
+
+    uintptr_t runtimeIMP = (uintptr_t)imp;
+    uintptr_t imageBase = (uintptr_t)info.dli_fbase;
+    NSString *imageOffset = runtimeIMP >= imageBase
+        ? [NSString stringWithFormat:@"0x%llx", (unsigned long long)(runtimeIMP - imageBase)]
+        : @"unavailable";
+    GNDLoadedImageLayout layout = {0};
+    BOOL hasLayout = GNDLoadedImageLayoutForAddress(info.dli_fbase, image, &layout);
+    NSString *layoutFields = hasLayout
+        ? [NSString stringWithFormat:@"imageIndex=%u header=%p slide=0x%llx textVMAddr=0x%llx runtimeTextBase=%p",
+           layout.imageIndex, layout.header, (unsigned long long)(uint64_t)layout.slide,
+           (unsigned long long)layout.textVMAddr, (void *)layout.runtimeTextBase]
+        : @"imageIndex=unavailable header=unavailable slide=unavailable textVMAddr=unavailable runtimeTextBase=unavailable";
+    GNDLogTagged(tag, @"class=%@ selector=%@ imp=%p imageBase=%p imageOffset=%@ %@ image=%@",
+                 className, selectorName, imp, info.dli_fbase, imageOffset, layoutFields, image);
 }
 
 static BOOL GNDClassIsGlowOwned(Class cls) {
@@ -178,7 +264,7 @@ static void GNDLogMethodList(Class cls, BOOL classMethods) {
         if (![gNDLoggedMethodEntries containsObject:entry]) {
             [gNDLoggedMethodEntries addObject:entry];
             const char *classImage = class_getImageName(cls);
-            GNDLogTagged(@"GLOW-METHOD", @"class=%@ classImage=%@ kind=%@ selector=%@ encoding=%@ imp=%p image=%@ symbol=%@",
+            GNDLogTagged(@"GLOW-METHOD", @"class=%@ classImage=%@ kind=%@ selector=%@ encoding=%@ imp=%p image=%@ dladdrSymbolHint=%@",
                          GNDClassName(cls), classImage ? [NSString stringWithUTF8String:classImage] : @"-",
                          classMethods ? @"class" : @"instance", selector,
                          GNDMethodEncoding(method), imp, image, symbol ?: @"-");
@@ -213,7 +299,7 @@ static void GNDLogGlowPatchesForClass(NSString *name) {
                                classMethods ? @"class" : @"instance", method, imp];
             if ([gNDLoggedPatchEntries containsObject:entry]) continue;
             [gNDLoggedPatchEntries addObject:entry];
-            GNDLogTagged(@"GLOW-PATCH", @"class=%@ kind=%@ selector=%@ encoding=%@ imp=%p image=%@ symbol=%@",
+            GNDLogTagged(@"GLOW-PATCH", @"class=%@ kind=%@ selector=%@ encoding=%@ imp=%p image=%@ dladdrSymbolHint=%@",
                          name, classMethods ? @"class" : @"instance", selector,
                          GNDMethodEncoding(method), imp, image, symbol ?: @"-");
         }
@@ -242,7 +328,7 @@ static void GNDInspectLegacyContextIMP(void) {
     NSString *symbol = nil;
     NSString *image = GNDImageForAddress((const void *)imp, &symbol);
     BOOL responds = cls && class_respondsToSelector(cls, selector);
-    NSString *state = [NSString stringWithFormat:@"responds=%@ owner=%@ direct=%@ imp=%p encoding=%@ image=%@ symbol=%@ inGlow=%@",
+    NSString *state = [NSString stringWithFormat:@"responds=%@ owner=%@ direct=%@ imp=%p encoding=%@ image=%@ dladdrSymbolHint=%@ inGlow=%@",
                        responds ? @"YES" : @"NO", GNDClassName(owner),
                        directMethod && owner == cls ? @"YES" : @"NO", imp,
                        GNDMethodEncoding(resolvedMethod), image, symbol ?: @"-",
@@ -251,6 +337,20 @@ static void GNDInspectLegacyContextIMP(void) {
     gNDLastLegacyIMPState = state;
     GNDLogTagged(@"LEGACY-IMP", @"class=%@ selector=%@ %@", kGNDLegacyItemClass,
                  kGNDLegacyContextSelector, state);
+    GNDLogIMPMap(@"LEGACY-IMP-MAP", kGNDLegacyItemClass, kGNDLegacyContextSelector, imp);
+}
+
+static void GNDLogDirectGlowIMPMap(NSString *className, SEL selector) {
+    Class cls = NSClassFromString(className);
+    Method method = cls ? GNDDirectMethod(cls, selector) : NULL;
+    if (!method) return;
+    GNDLogIMPMap(@"GLOW-IMP-MAP", className, NSStringFromSelector(selector),
+                 method_getImplementation(method));
+}
+
+static void GNDLogConfirmedGlowIMPMaps(void) {
+    GNDLogDirectGlowIMPMap(kGNDLegacyBarClass, @selector(layoutSubviews));
+    GNDLogDirectGlowIMPMap(kGNDLegacyItemClass, @selector(layoutSubviews));
 }
 
 static void GNDRefreshRuntimeMetadata(void) {
@@ -272,6 +372,7 @@ static void GNDRefreshRuntimeMetadata(void) {
         kGNDLegacyItemClass
     ];
     for (NSString *name in protocolClasses) GNDLogProtocolStatus(name);
+    GNDLogConfirmedGlowIMPMaps();
 
     NSArray<NSString *> *glowClasses = @[
         @"SettingsViewController", @"DVNSheetPresenter", @"DVNSheetController",
@@ -636,6 +737,7 @@ static void GNDInitialize(void) {
         if (!GNDIsFacebookProcess()) return;
         gNDLoggedMethodEntries = [NSMutableSet set];
         gNDLoggedPatchEntries = [NSMutableSet set];
+        gNDLoggedIMPMaps = [NSMutableSet set];
         GNDInstallPassiveInteractionObservers();
         GNDLog(@"loaded bundle=%@ executable=%@ iOS=%@",
                NSBundle.mainBundle.bundleIdentifier ?: @"-",
