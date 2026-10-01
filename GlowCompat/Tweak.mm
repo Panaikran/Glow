@@ -7,6 +7,7 @@
 #import <stdarg.h>
 #import <stdlib.h>
 #import <string.h>
+#import <unistd.h>
 
 @interface GlowFloatingTabContextMenuDelegate : NSObject <UIContextMenuInteractionDelegate>
 @property (nonatomic, weak) UIView *item;
@@ -455,6 +456,13 @@ static void GCScheduleSetup(void) {
 
 __attribute__((constructor))
 static void GCInitialize(void) {
+#if GLOWCOMPAT_DISABLE_STARTUP
+    static const char enterMarker[] = "[GlowCompatEarly] ctor-enter\n";
+    static const char exitMarker[] = "[GlowCompatEarly] ctor-exit\n";
+    (void)write(STDERR_FILENO, enterMarker, sizeof(enterMarker) - 1);
+    (void)write(STDERR_FILENO, exitMarker, sizeof(exitMarker) - 1);
+    return;
+#else
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!GCIsFacebookProcess()) return;
@@ -469,4 +477,5 @@ static void GCInitialize(void) {
             GCScheduleSetup();
         });
     }
+#endif
 }
