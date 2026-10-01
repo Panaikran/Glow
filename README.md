@@ -32,6 +32,10 @@ A simple, clean, and powerful tweak for Facebook
 
 **Glow settings are available via long press on any tab**
 
+## Facebook 580 navbar compatibility
+
+Generated Facebook IPAs include the original `Glow.dylib` plus a separate `GlowCompat.dylib`. GlowCompat requires Glow and restores only the Glow settings context-menu entry on Facebook 580's floating navbar; it does not replace or merge into Glow. Other navbar features may need future compatibility work. Use a clean decrypted IPA as workflow input; the workflow stops if either dylib is already present to prevent duplicate load commands. Do not manually inject another GlowCompat copy into a generated IPA that already includes it.
+
 
 ## Reviews
 Review by [@qbap](https://github.com/qbap) on ONE Jailbreak: https://onejailbreak.com/blog/glow-facebook-ipa/

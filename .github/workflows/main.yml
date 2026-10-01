@@ -56,11 +56,57 @@ jobs:
             exit 1
           fi
 
+          if unzip -Z1 "${{ github.workspace }}/facebook.ipa" | grep -Eq '^Payload/[^/]+\.app/Frameworks/(Glow|GlowCompat)\.dylib$'; then
+            echo "::error::The input IPA already contains Glow or GlowCompat. Supply a clean decrypted IPA to avoid duplicate load commands."
+            exit 1
+          fi
+
       - name: Install Dependencies
         run: brew install make ldid
 
       - name: Set PATH environment variable
         run: echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
+
+      - name: Install Theos
+        run: |
+          set -euo pipefail
+          export THEOS="$RUNNER_TEMP/theos"
+          git clone --depth 1 --recurse-submodules https://github.com/theos/theos.git "$THEOS"
+          xcrun --sdk iphoneos --show-sdk-path
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      - name: Build GlowCompat
+        run: |
+          set -euo pipefail
+          make -C main/GlowCompat ARCHS=arm64 FINALPACKAGE=1 clean all
+          cp main/GlowCompat/.theos/obj/arm64/GlowCompat.dylib "$GITHUB_WORKSPACE/GlowCompat.dylib"
+
+          compat_archs="$(lipo -archs "$GITHUB_WORKSPACE/GlowCompat.dylib" | tr -d '[:space:]')"
+          if [[ "$compat_archs" != "arm64" ]]; then
+            echo "::error::GlowCompat must contain only arm64; found: $compat_archs"
+            exit 1
+          fi
+          echo "GlowCompat architectures=$compat_archs"
+          build_info="$(xcrun vtool -show-build "$GITHUB_WORKSPACE/GlowCompat.dylib")"
+          printf '%s\n' "$build_info"
+          if ! grep -Eq 'minos[[:space:]]+15\.0' <<< "$build_info"; then
+            echo "::error::GlowCompat must target iOS 15.0."
+            exit 1
+          fi
+          compat_load_commands="$(otool -l "$GITHUB_WORKSPACE/GlowCompat.dylib")"
+          if ! grep -q '__mod_init_func' <<< "$compat_load_commands"; then
+            echo "::error::GlowCompat constructor section is missing."
+            exit 1
+          fi
+          compat_build_deps="$(otool -L "$GITHUB_WORKSPACE/GlowCompat.dylib")"
+          if grep -Eiq 'CydiaSubstrate|libsubstrate' <<< "$compat_build_deps"; then
+            echo "::error::GlowCompat must not depend on CydiaSubstrate or libsubstrate."
+            exit 1
+          fi
+
+          compat_sha="$(shasum -a 256 "$GITHUB_WORKSPACE/GlowCompat.dylib" | awk '{print $1}')"
+          echo "GlowCompat_0.1.0_arm64.dylib SHA-256=$compat_sha"
+          echo "GLOWCOMPAT_SHA256=$compat_sha" >> "$GITHUB_ENV"
 
       - name: Install cyan
         run: pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
@@ -77,19 +123,19 @@ jobs:
 
           response=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$api_url")
           tag_name=$(echo "$response" | jq -r '.tag_name')
-          deb_url=$(echo "$response" | jq -r '.assets[0].browser_download_url')
+          deb_url=$(jq -r '.assets[] | select(.name | endswith("_iphoneos-arm64.deb")) | .browser_download_url' <<< "$response")
 
           if [[ "$deb_url" == "null" || -z "$deb_url" ]]; then
-            echo "::error::Failed to get tweak URL from Github API"
+            echo "::error::Failed to find the arm64 Glow package in the latest release."
             exit 1
           fi
 
           echo "GLOW_TAG=$tag_name" >> $GITHUB_ENV
-          echo "Downloading: $deb_url"
+          echo "Downloading arm64 Glow package: $deb_url"
           wget "$deb_url" --no-verbose -O ${{ github.workspace }}/glow_fb.deb
 
       - name: Inject tweaks into IPA
-        run: cyan -i facebook.ipa -o Glow_FB_${{ env.GLOW_TAG }}.ipa -uwef glow_fb.deb -n "${{ inputs.display_name }}" -b ${{ inputs.bundle_id }} -s
+        run: cyan -i facebook.ipa -o Glow_FB_${{ env.GLOW_TAG }}.ipa -u -w -e -f glow_fb.deb GlowCompat.dylib -n "${{ inputs.display_name }}" -b "${{ inputs.bundle_id }}" -s
 
       - name: Strip embedded Swift dylibs
         run: |
@@ -99,6 +145,83 @@ jobs:
           zip -qr ../Glow_FB_${{ env.GLOW_TAG }}_clean.ipa Payload
           cd ..
           mv Glow_FB_${{ env.GLOW_TAG }}_clean.ipa Glow_FB_${{ env.GLOW_TAG }}.ipa
+
+      - name: Verify injected Glow binaries
+        run: |
+          set -euo pipefail
+
+          app_bundle="$(find tmp_payload/Payload -mindepth 1 -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [[ -z "$app_bundle" ]]; then
+            echo "::error::No app bundle found in the generated IPA."
+            exit 1
+          fi
+          frameworks="$app_bundle/Frameworks"
+          glow="$frameworks/Glow.dylib"
+          compat="$frameworks/GlowCompat.dylib"
+          if [[ ! -f "$glow" || ! -f "$compat" ]]; then
+            echo "::error::Generated IPA must contain both Glow.dylib and GlowCompat.dylib in Frameworks/."
+            exit 1
+          fi
+
+          executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_bundle/Info.plist")"
+          executable="$app_bundle/$executable_name"
+          if [[ ! -f "$executable" ]]; then
+            echo "::error::Facebook executable is missing from the generated app bundle."
+            exit 1
+          fi
+
+          lipo -verify_arch arm64 "$glow"
+          lipo -verify_arch arm64 "$compat"
+          app_arch_count="$(lipo -archs "$executable" | wc -w | tr -d '[:space:]')"
+          load_commands="$(otool -L "$executable")"
+          for dylib in Glow.dylib GlowCompat.dylib; do
+            load_count="$(grep -F -c "@rpath/$dylib" <<< "$load_commands" || true)"
+            if [[ "$load_count" -ne "$app_arch_count" ]]; then
+              echo "::error::Expected one @rpath/$dylib load command per executable architecture; found $load_count for $app_arch_count architectures."
+              exit 1
+            fi
+          done
+
+          compat_deps="$(otool -L "$compat" | tail -n +2 | awk '{print $1}')"
+          if grep -Eiq 'CydiaSubstrate|libsubstrate' <<< "$compat_deps"; then
+            echo "::error::GlowCompat has an unexpected Substrate dependency."
+            exit 1
+          fi
+          glow_deps="$(otool -L "$glow" | tail -n +2 | awk '{print $1}')"
+          if grep -Fiq 'libsubstrate' <<< "$glow_deps"; then
+            echo "::error::Glow.dylib has an unexpected libsubstrate dependency."
+            exit 1
+          fi
+          while IFS= read -r dependency; do
+            [[ -z "$dependency" ]] && continue
+            if [[ "$dependency" == *CydiaSubstrate* && "$dependency" != '@rpath/CydiaSubstrate.framework/CydiaSubstrate' ]]; then
+              echo "::error::Glow.dylib has an unexpected CydiaSubstrate dependency: $dependency"
+              exit 1
+            fi
+          done <<< "$glow_deps"
+          if grep -Fxq '@rpath/CydiaSubstrate.framework/CydiaSubstrate' <<< "$glow_deps" &&
+             [[ ! -f "$frameworks/CydiaSubstrate.framework/CydiaSubstrate" ]]; then
+            echo "::error::Glow's expected CydiaSubstrate compatibility framework is missing."
+            exit 1
+          fi
+
+          for dylib in "$glow" "$compat"; do
+            dylib_load_commands="$(otool -l "$dylib")"
+            if ! grep -q 'cmd LC_CODE_SIGNATURE' <<< "$dylib_load_commands"; then
+              echo "::error::Missing fakesign code signature: $dylib"
+              exit 1
+            fi
+            codesign --verify --strict "$dylib"
+          done
+
+          echo "Glow.dylib dependencies:"
+          sed 's/^/  /' <<< "$glow_deps"
+          echo "GlowCompat.dylib dependencies:"
+          sed 's/^/  /' <<< "$compat_deps"
+          echo "GlowCompat build SHA-256=$GLOWCOMPAT_SHA256"
+          echo "Packaged Glow.dylib SHA-256=$(shasum -a 256 "$glow" | awk '{print $1}')"
+          echo "Packaged GlowCompat.dylib SHA-256=$(shasum -a 256 "$compat" | awk '{print $1}')"
+          echo "Packaged dylib load commands verified for $app_arch_count executable architecture(s)."
 
       - uses: softprops/action-gh-release@v2.0.1
         with:

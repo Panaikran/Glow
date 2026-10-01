@@ -2,5 +2,8 @@
 *.deb
 *.ipa
 /artifacts/
+/tmp_payload/
+/GlowCompat.dylib
+/glow_fb.deb
 /GlowNavDiagnostics/.theos/
 /GlowCompat/.theos/
