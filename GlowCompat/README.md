@@ -1,6 +1,8 @@
 # GlowCompat 0.1.0
 
-Standalone LiveContainer adapter for Facebook 580's `FBFloatingTabBar.FBFloatingTabBarItemView`. It validates Glow's directly installed legacy context-menu method at runtime, then forwards UIKit's context-menu request to that Glow IMP with the real floating item as `self`. It does not add gestures or change Facebook's existing gesture recognizers.
+Facebook 580 adapter for `FBFloatingTabBar.FBFloatingTabBarItemView`. It validates Glow's directly installed legacy context-menu method at runtime, then forwards UIKit's context-menu request to that Glow IMP with the real floating item as `self`. It does not add gestures or change Facebook's existing gesture recognizers.
+
+For generated IPAs, `GlowCompat.dylib` is stored in `Facebook.app/Frameworks` and loaded after startup by the embedded GlowLateLoader. Do not add it as a Facebook launch dependency: the tested Glow 1.3.1 initializer aborts when another dylib is launch-loaded beside it in this environment. For standalone LiveContainer testing, GlowCompat may still be enabled as a later-added tweak while Glow is already embedded in Facebook.
 
 ## Build
 
@@ -32,4 +34,4 @@ In PowerShell, start filtered logging:
 7. Repeat once on Reels; confirm ordinary tab taps still switch tabs.
 8. Navigate away and back to exercise navbar item recreation; confirm Facebook does not crash, then stop logging.
 
-Successful menu presentation and opening Glow settings still require on-device verification.
+The late-loaded generated IPA path has been verified on-device with Facebook 580, including Home and Reels long-press, opening Glow's real settings controller, ordinary tab taps, and a cold relaunch.

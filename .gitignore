@@ -7,3 +7,5 @@
 /glow_fb.deb
 /GlowNavDiagnostics/.theos/
 /GlowCompat/.theos/
+__pycache__/
+*.py[cod]
