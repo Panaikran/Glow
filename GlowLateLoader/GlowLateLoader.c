@@ -10,7 +10,19 @@ typedef signed long ssize_t;
 #endif
 
 #define IN_CODE __attribute__((used, section("__TEXT,__glow_code")))
-#define STR(name, value) static const char name[] IN_CODE = value
+/*
+ * Modern Apple Clang rejects C functions and C data declarations forced into
+ * the same custom Mach-O section because it assigns them different section
+ * attributes. Emit the strings with inline assembler instead. Hidden symbols
+ * keep references direct so the patcher still receives PAGE21/PAGEOFF12
+ * relocations within __glow_code.
+ */
+#define STR(name, value) \
+    extern const char name[] __attribute__((visibility("hidden"))); \
+    __asm__(".section __TEXT,__glow_code,regular,pure_instructions\n" \
+            ".private_extern _" #name "\n" \
+            "_" #name ":\n" \
+            ".asciz " #value "\n")
 #define SYMBOL(type, name) ((type)dlsym((void *)-2, name))
 #define PATH_MAX 1024
 #define F_OK 0
