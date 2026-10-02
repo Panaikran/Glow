@@ -18,6 +18,7 @@ typedef signed long ssize_t;
  * relocations within __glow_code.
  */
 #define STR(name, value) \
+    enum { name##_len = sizeof(value) - 1 }; \
     extern const char name[] __attribute__((visibility("hidden"))); \
     __asm__(".section __TEXT,__glow_code,regular,pure_instructions\n" \
             ".private_extern _" #name "\n" \
@@ -74,7 +75,7 @@ typedef const char *(*dlerror_fn)(void);
 #define O_WRONLY 1
 #define O_CREAT 0x200
 #define O_TRUNC 0x400
-#define STATUS(value) write_diag_file(kStatusName, sizeof(kStatusName) - 1, value, sizeof(value) - 1)
+#define STATUS(value) write_diag_file(kStatusName, kStatusName_len, value, value##_len)
 
 STR(kGetenv, "getenv");
 STR(kOpen, "open");
@@ -177,7 +178,7 @@ IN_CODE static int facebook_compat_path(char *out, size_t cap) {
     while (slash && info.dli_fname[slash - 1] != '/') --slash;
     if (!slash || !same_text(info.dli_fname + slash, kFacebookName)) return 0;
 
-    size_t tail_len = sizeof(kFrameworks) - 1;
+    size_t tail_len = kFrameworks_len;
     if (slash + tail_len + 1 > cap) return 0;
     size_t pos = 0;
     while (pos < slash) {
@@ -227,7 +228,7 @@ IN_CODE static void glow_late_callback(void *context) {
         const char *error = get_error ? get_error() : 0;
         size_t error_len = bounded_length(error, 256);
         if (error && error_len && error_len < 256)
-            write_diag_file(kErrorName, sizeof(kErrorName) - 1, error, error_len);
+            write_diag_file(kErrorName, kErrorName_len, error, error_len);
 #endif
         STATUS(kDlopenFailed);
         return;
