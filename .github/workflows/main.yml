@@ -248,9 +248,10 @@ jobs:
           (cd "$payload" && zip -qr "$clean_ipa" Payload)
           mv "$clean_ipa" "$ipa"
 
-          codesign --verify --strict "$executable"
-          codesign --verify --strict "$glow"
-          codesign --verify --strict "$compat"
+          # ldid produces the iOS pseudo-signatures used by this workflow.
+          # Apple's host-side codesign verifier does not reliably accept those
+          # signatures, so the next verifier step validates the embedded
+          # signature blobs and requires Facebook's signature to be regenerated.
           unzip -tq "$ipa"
           echo "GlowCompat remains file-only: $compat"
           echo "Facebook prepatch executable saved for preservation checks: $baseline"
