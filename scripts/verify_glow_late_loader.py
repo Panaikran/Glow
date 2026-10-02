@@ -57,12 +57,39 @@ def app_binary(archive, app, relative):
     return member, archive.read(member)
 
 
+def embedded_signature_blob(data, meta, label):
+    command = unique(
+        [command for command in meta["commands"] if command["cmd"] == LC_CODE_SIGNATURE],
+        f"{label} LC_CODE_SIGNATURE",
+    )
+    if command["size"] < 16:
+        raise ValueError(f"{label} has a truncated LC_CODE_SIGNATURE command")
+    dataoff, datasize = struct.unpack_from("<II", command["raw"], 8)
+    if dataoff == 0 or datasize < 12 or dataoff + datasize > len(data):
+        raise ValueError(f"{label} has an invalid embedded-signature range")
+
+    blob = data[dataoff:dataoff + datasize]
+    magic, length, count = struct.unpack_from(">III", blob, 0)
+    if magic != 0xFADE0CC0:
+        raise ValueError(f"{label} embedded signature is not a SuperBlob")
+    if length < 12 or length > len(blob) or count == 0 or 12 + count * 8 > length:
+        raise ValueError(f"{label} embedded signature header is malformed")
+
+    for index in range(count):
+        _slot_type, offset = struct.unpack_from(">II", blob, 12 + index * 8)
+        if offset + 8 > length:
+            raise ValueError(f"{label} embedded signature index is out of range")
+        _child_magic, child_length = struct.unpack_from(">II", blob, offset)
+        if child_length < 8 or offset + child_length > length:
+            raise ValueError(f"{label} embedded signature child blob is malformed")
+    return blob[:length]
+
+
 def verify_signed_arm64(data, label):
     meta = parse_macho(data)
     if meta["cpu"] != CPU_TYPE_ARM64:
         raise ValueError(f"{label} is not arm64")
-    unique([command for command in meta["commands"] if command["cmd"] == LC_CODE_SIGNATURE],
-           f"{label} LC_CODE_SIGNATURE")
+    embedded_signature_blob(data, meta, label)
     return meta
 
 
@@ -164,6 +191,11 @@ def compare_presigned_executable(base_data, base, final_data, final):
     if old_text_header != new_text_header:
         raise ValueError("__TEXT segment mapping/protection fields changed")
     verify_header_slack(base_data, base, final_data, final)
+
+    old_signature = embedded_signature_blob(base_data, base, "baseline Facebook executable")
+    new_signature = embedded_signature_blob(final_data, final, "final Facebook executable")
+    if old_signature == new_signature:
+        raise ValueError("Facebook embedded signature was not regenerated after patching")
 
     if len(base["segments"]) != len(final["segments"]):
         raise ValueError("segment count changed")
