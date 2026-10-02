@@ -110,11 +110,34 @@ jobs:
             echo "::error::GlowCompat must target iOS 15.0."
             exit 1
           fi
-          compat_load_commands="$(otool -l "$GITHUB_WORKSPACE/GlowCompat.dylib")"
-          if ! grep -q '__mod_init_func' <<< "$compat_load_commands"; then
-            echo "::error::GlowCompat constructor section is missing."
-            exit 1
-          fi
+          python3 - "$GITHUB_WORKSPACE/GlowCompat.dylib" <<'PY'
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "main/scripts")
+          from glow_macho import parse_macho, SECTION_TYPE, S_INIT_FUNC_OFFSETS
+
+          S_MOD_INIT_FUNC_POINTERS = 0x9
+
+          path = Path(sys.argv[1])
+          meta = parse_macho(path.read_bytes())
+          initializer_sections = [
+              section for section in meta["sections"]
+              if section["size"] > 0 and
+              (section["flags"] & SECTION_TYPE) in
+              (S_MOD_INIT_FUNC_POINTERS, S_INIT_FUNC_OFFSETS)
+          ]
+          if not initializer_sections:
+              raise SystemExit("GlowCompat constructor/initializer section is missing.")
+
+          for section in initializer_sections:
+              print(
+                  "GlowCompat initializer section="
+                  f"{section['segment']},{section['name']} "
+                  f"type=0x{section['flags'] & SECTION_TYPE:x} "
+                  f"size={section['size']}"
+              )
+          PY
           compat_build_deps="$(otool -L "$GITHUB_WORKSPACE/GlowCompat.dylib")"
           if grep -Eiq 'CydiaSubstrate|libsubstrate' <<< "$compat_build_deps"; then
             echo "::error::GlowCompat must not depend on CydiaSubstrate or libsubstrate."
