@@ -317,6 +317,7 @@ jobs:
           echo "FINAL_IPA_SHA256=$ipa_sha"
 
       - uses: softprops/action-gh-release@v2.0.1
+        if: github.ref == 'refs/heads/main'
         with:
           tag_name: glow-fb-${{ env.GLOW_TAG }}
           name: Glow_FB ${{ env.GLOW_TAG }}
@@ -324,5 +325,6 @@ jobs:
           draft: true
 
       - name: Output Release URL
+        if: github.ref == 'refs/heads/main'
         run: |
           echo "::notice::Release available at: https://github.com/${{ github.repository }}/releases"
