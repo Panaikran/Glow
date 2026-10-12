@@ -148,9 +148,13 @@ jobs:
             exit 1
           fi
 
-          compat_sha="$(shasum -a 256 "$GITHUB_WORKSPACE/GlowCompat.dylib" | awk '{print $1}')"
-          echo "GlowCompat_0.1.0_arm64.dylib SHA-256=$compat_sha"
-          echo "GLOWCOMPAT_SHA256=$compat_sha" >> "$GITHUB_ENV"
+          compat_build_sha="$(shasum -a 256 "$GITHUB_WORKSPACE/GlowCompat.dylib" | awk '{print $1}')"
+          if [[ ! "$compat_build_sha" =~ ^[[:xdigit:]]{64}$ ]]; then
+            echo "::error::Could not parse the built GlowCompat SHA-256."
+            exit 1
+          fi
+          echo "GLOWCOMPAT_BUILD_SHA256=$compat_build_sha" >> "$GITHUB_ENV"
+          echo "GLOWCOMPAT_BUILD_SHA256=$compat_build_sha"
 
       - name: Build embedded late loader
         run: |
@@ -223,6 +227,13 @@ jobs:
           fi
           cp "$GITHUB_WORKSPACE/GlowCompat.dylib" "$compat"
           ldid -S "$compat"
+          compat_packaged_sha="$(shasum -a 256 "$compat" | awk '{print $1}')"
+          if [[ ! "$compat_packaged_sha" =~ ^[[:xdigit:]]{64}$ ]]; then
+            echo "::error::Could not parse the packaged GlowCompat SHA-256."
+            exit 1
+          fi
+          echo "GLOWCOMPAT_PACKAGED_SHA256=$compat_packaged_sha" >> "$GITHUB_ENV"
+          echo "GLOWCOMPAT_PACKAGED_SHA256=$compat_packaged_sha"
 
           baseline="$GITHUB_WORKSPACE/Facebook.prepatch.arm64"
           entitlements="$GITHUB_WORKSPACE/Facebook.entitlements.plist"
@@ -262,11 +273,51 @@ jobs:
           python3 main/scripts/verify_glow_late_loader.py \
             "Glow_FB_${GLOW_TAG}.ipa" "$GITHUB_WORKSPACE/Facebook.prepatch.arm64" \
             | tee "$GITHUB_WORKSPACE/GlowFinal-verification.json"
+          python3 - "$GITHUB_WORKSPACE/GlowFinal-verification.json" "$GLOWCOMPAT_PACKAGED_SHA256" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          try:
+              report = json.loads(Path(sys.argv[1]).read_text())
+          except (OSError, json.JSONDecodeError) as error:
+              raise SystemExit(f"Could not parse production verifier output: {error}")
+
+          expected = sys.argv[2]
+          if not re.fullmatch(r"[0-9a-f]{64}", expected):
+              raise SystemExit("GLOWCOMPAT_PACKAGED_SHA256 is not a valid SHA-256.")
+          if report.get("verification") != "PASS":
+              raise SystemExit("Production IPA verifier did not report PASS.")
+
+          compat = report.get("glowcompat")
+          if not isinstance(compat, dict):
+              raise SystemExit("Production verifier output is missing GlowCompat.")
+          member = compat.get("path")
+          parts = member.split("/") if isinstance(member, str) else []
+          if (len(parts) != 4 or parts[0] != "Payload" or
+                  not parts[1].endswith(".app") or parts[2:] != ["Frameworks", "GlowCompat.dylib"]):
+              raise SystemExit("Production verifier output does not identify the IPA GlowCompat member.")
+
+          embedded = compat.get("sha256")
+          if not isinstance(embedded, str) or not re.fullmatch(r"[0-9a-f]{64}", embedded):
+              raise SystemExit("Production verifier output has no valid embedded GlowCompat SHA-256.")
+          if embedded != expected:
+              raise SystemExit(
+                  f"Packaged GlowCompat SHA-256 mismatch: recorded={expected}, embedded={embedded}"
+              )
+          print(f"Verified IPA-embedded GlowCompat SHA-256={embedded}")
+          PY
           echo "Glow package input SHA-256=c4e64385bdf471e74d3d65edf6e982bf3ac5613246f4368f90a3b262f1222847"
-          echo "GlowCompat build SHA-256=$GLOWCOMPAT_SHA256"
-          echo "Final IPA SHA-256=$(shasum -a 256 "Glow_FB_${GLOW_TAG}.ipa" | awk '{print $1}')"
+          ipa_sha="$(shasum -a 256 "Glow_FB_${GLOW_TAG}.ipa" | awk '{print $1}')"
+          if [[ ! "$ipa_sha" =~ ^[[:xdigit:]]{64}$ ]]; then
+            echo "::error::Could not parse the final IPA SHA-256."
+            exit 1
+          fi
+          echo "FINAL_IPA_SHA256=$ipa_sha"
 
       - uses: softprops/action-gh-release@v2.0.1
+        if: github.ref == 'refs/heads/main'
         with:
           tag_name: glow-fb-${{ env.GLOW_TAG }}
           name: Glow_FB ${{ env.GLOW_TAG }}
@@ -274,5 +325,6 @@ jobs:
           draft: true
 
       - name: Output Release URL
+        if: github.ref == 'refs/heads/main'
         run: |
           echo "::notice::Release available at: https://github.com/${{ github.repository }}/releases"
